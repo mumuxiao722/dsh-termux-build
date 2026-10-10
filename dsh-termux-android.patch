@@ -1,0 +1,189 @@
+diff --git a/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js b/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js
+--- a/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js
+@@ -1,7 +1,7 @@
+ import z from "@deepseek-ai/schemastery";
+ import { SessionFormatUnsupportedMigrationError, createSessionFormatCatalogWithChildren, historicalSessionFormatCatalog, sessionFormatCatalog } from "@deepseek-ai/dsh-session-format-catalog";
+ import { readdirSync } from "node:fs";
+-import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";
++import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, truncate } from "node:fs/promises";
+ import { basename, dirname, isAbsolute, join, parse, resolve, toNamespacedPath } from "node:path";
+ import { performance } from "node:perf_hooks";
+ import { scheduler } from "node:timers/promises";
+@@ -3139,7 +3139,8 @@
+ 		const tmp = await this.writeSyncedTempFile(finalPath, content);
+ 		let linked = false;
+ 		try {
+-			await link(tmp, finalPath);
++			if (process.platform === "android") await rename(tmp, finalPath);
++			else await link(tmp, finalPath);
+ 			linked = true;
+ 		} finally {
+ 			/* v8 ignore next -- link failure is the TOCTOU/IO race guarded above; not reachable in test */
+diff --git a/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js b/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js
+--- a/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js
+@@ -6,8 +6,8 @@
+ import z from "@deepseek-ai/schemastery";
+ import { FileSystem, FsError, FsTargetKey, FsVersion } from "@deepseek-ai/dsh-fs";
+ import { randomUUID } from "node:crypto";
+-import { createReadStream, realpath } from "node:fs";
+-import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
++import { constants as fsConstants, createReadStream, realpath } from "node:fs";
++import { chmod, copyFile, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+ import { TextDecoder, promisify } from "node:util";
+ //#region lib/types/win32.js
+ /**
+@@ -548,7 +548,15 @@
+ 		handle = void 0;
+ 		throwIfAborted(signal, "write");
+ 		if (createIfAbsent !== void 0) try {
+-			await linkFile(tempPath, absolutePath);
++			try {
++				await linkFile(tempPath, absolutePath);
++			} catch (linkError) {
++				/* Android 禁止应用调用 link(2)（SELinux 对应用域的硬链接限制），无条件 EACCES。
++				   退到 copyFile 的 COPYFILE_EXCL：它以 O_CREAT|O_EXCL 建目标，仍保证
++				   "已存在则不覆盖"，与 link 的 no-replace 语义一致。其他平台/错误照旧上抛。 */
++				if (process.platform !== "android" || linkError?.code !== "EACCES" && linkError?.code !== "EPERM") throw linkError;
++				await copyFile(tempPath, absolutePath, fsConstants.COPYFILE_EXCL);
++			}
+ 		} catch (error) {
+ 			await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+ 		}
+diff --git a/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js b/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js
+--- a/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js
+@@ -4,7 +4,7 @@
+ import { dshCachePath, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
+ import { createHash, randomUUID } from "node:crypto";
+ import { constants, createReadStream } from "node:fs";
+-import { chmod, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
++import { chmod, copyFile, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+ import { createLazyRequire } from "@deepseek-ai/dsh-lazy-require";
+ //#region lib/types/compression-limiter.js
+ /** Instance-owned concurrency bound for native image transformations. */
+@@ -367,6 +367,28 @@
+ 	/* v8 ignore stop */
+ }
+ /**
++ * Publish `source` at `target` with no-replace semantics.
++ *
++ * Upstream uses link(2). Android's SELinux policy forbids apps from creating
++ * hard links at all, so link() fails with EACCES unconditionally on
++ * Termux/bionic — which is neither EEXIST nor a recoverable race, so the
++ * caller would rethrow and every attachment save would fail (surfacing as
++ * `read_image` errors). Fall back to copyFile with COPYFILE_EXCL, which opens
++ * the destination with O_CREAT|O_EXCL and therefore keeps the same
++ * "refuse to clobber an existing object" contract.
++ * @param {string} source - existing file to publish.
++ * @param {string} target - destination that must not already exist.
++ */
++async function publishNoReplace(source, target) {
++	try {
++		await link(source, target);
++	} catch (error) {
++		const code = error instanceof Error && "code" in error ? error.code : void 0;
++		if (process.platform !== "android" || code !== "EACCES" && code !== "EPERM") throw error;
++		await copyFile(source, target, constants.COPYFILE_EXCL);
++	}
++}
++/**
+ * Create one private directory tree and persist every ancestor entry up to a
+ * caller-vouched durable boundary. The walk deliberately ignores what mkdir
+ * reports as newly created: a concurrent first save can create a level this
+@@ -388,7 +410,18 @@
+ 	let level = target;
+ 	while (level !== stop) {
+ 		const parent = dirname(level);
+-		await syncDirectory(parent);
++		try {
++			await syncDirectory(parent);
++		} catch (error) {
++			/* Android's app sandbox refuses to open the app-data root and everything
++			   above it, so on that platform not every ancestor of the home directory
++			   can be synced the way it is on a normal Linux host. A level this process
++			   cannot open is not ours to sync — stop the walk rather than failing the
++			   whole save. Every level below it has already been synced. */
++			const code = error instanceof Error && "code" in error ? error.code : void 0;
++			if (process.platform !== "android" || code !== "EACCES" && code !== "EPERM") throw error;
++			return;
++		}
+ 		/* v8 ignore next -- filesystem-root guard: callers pass a boundary that is an ancestor of path, so the walk reaches it first. */
+ 		if (parent === level) return;
+ 		level = parent;
+@@ -477,7 +510,7 @@
+ 	try {
+ 		await ensureDurableDirectory(parent, await ensureDurableHome(dirname(dirname(resolve(root)))));
+ 		try {
+-			await link(source, target);
++			await publishNoReplace(source, target);
+ 		} catch (error) {
+ 			/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
+ 			if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+@@ -538,7 +571,7 @@
+ 	try {
+ 		await ensureDurableDirectory(parent, staged.boundary);
+ 		try {
+-			await link(staged.path, target);
++			await publishNoReplace(staged.path, target);
+ 		} catch (error) {
+ 			/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
+ 			if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+diff --git a/node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js b/node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js
+--- a/node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js
+@@ -122,6 +122,12 @@
+ 		const executable = parse(process.execPath);
+ 		const executableSidecar = process.platform === "win32" ? join(executable.dir, `${executable.name}-rg.exe`) : `${process.execPath}-rg`;
+ 		if ("pkg" in process && existsSync(executableSidecar)) return executableSidecar;
++		/* Android publishes no @vscode/ripgrep platform package, so importing it
++		   rejects with "Could not find @vscode/ripgrep-android-arm64" and every
++		   grep/glob dies as SEARCH_FAILED. Termux ships a bionic `rg` next to this
++		   interpreter (pkg install ripgrep); use it rather than the missing
++		   prebuilt. executable.dir is the Termux bin directory. */
++		if (process.platform === "android") return join(executable.dir, "rg");
+ 		const dependency = (await import("@vscode/ripgrep")).rgPath;
+ 		return process.versions.electron === void 0 ? dependency : dependency.replace(/\.asar(?=[\\/])/u, ".asar.unpacked");
+ 	});
+diff --git a/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js b/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js
+--- a/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js
++++ b/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js
+@@ -667,7 +667,7 @@
+ * @returns Platform process inspector.
+ */
+ function createProcessInspector(platform = process.platform, arch = process.arch, internals = DEFAULT_INTERNALS) {
+-	if (platform === "linux") return new LinuxProcessInspector(arch, internals);
++	if (platform === "linux" || platform === "android") return new LinuxProcessInspector(arch, internals);
+ 	if (platform === "darwin") return new MacProcessInspector(internals);
+ 	if (platform === "win32") return createWindowsProcessInspector();
+ 	throw new Error(`subprocess-local: terminal inspection is unsupported on platform ${platform}`);
+@@ -808,7 +808,7 @@
+ 		if (platform === "win32") return child.exitCode === null && child.signalCode === null;
+ 		try {
+ 			process.kill(-pid, 0);
+-			if (directSettled && platform === "linux" && linuxGroupHasLiveMembers(pid) === false) return false;
++			if (directSettled && (platform === "linux" || platform === "android") && linuxGroupHasLiveMembers(pid) === false) return false;
+ 			return true;
+ 		} catch (error) {
+ 			const code = error.code;
+diff --git a/node_modules/@deepseek-ai/node-addon-system/lib/flock.js b/node_modules/@deepseek-ai/node-addon-system/lib/flock.js
+--- a/node_modules/@deepseek-ai/node-addon-system/lib/flock.js
++++ b/node_modules/@deepseek-ai/node-addon-system/lib/flock.js
+@@ -7,14 +7,14 @@
+     if (binding)
+         return binding;
+     const { platform, arch } = process;
+-    if (platform !== 'linux' && platform !== 'darwin') {
++    if (platform !== 'linux' && platform !== 'darwin' && platform !== 'android') {
+         throw Object.assign(new Error(`flock is not supported on ${platform}-${arch}`), {
+             code: 'ERR_FLOCK_UNSUPPORTED_PLATFORM',
+             syscall: 'flock',
+         });
+     }
+     let filename = 'system.node';
+-    if (platform === 'linux') {
++    if (platform === 'linux' || platform === 'android') {
+         // Node's report types omit the libc field supplied by Linux reports.
+         const report = process.report.getReport();
+         filename = join(report.header.glibcVersionRuntime ? 'glibc' : 'musl', filename);

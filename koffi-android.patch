@@ -1,0 +1,31 @@
+diff --git a/node_modules/koffi/lib/native/base/base.cc b/node_modules/koffi/lib/native/base/base.cc
+--- a/node_modules/koffi/lib/native/base/base.cc
++++ b/node_modules/koffi/lib/native/base/base.cc
+@@ -2949,7 +2949,7 @@
+ 
+ static StatResult StatAt(int fd, bool fd_is_directory, const char *filename, unsigned int flags, FileInfo *out_info)
+ {
+-#if defined(__linux__)
++#if defined(__linux__) && !defined(__ANDROID__)
+     const char *pathname = filename;
+     int stat_flags = (flags & (int)StatFlag::FollowSymlink) ? 0 : AT_SYMLINK_NOFOLLOW;
+     int stat_mask = STATX_TYPE | STATX_MODE | STATX_MTIME | STATX_BTIME | STATX_SIZE;
+@@ -5417,6 +5417,10 @@
+                         FunctionRef<Span<const uint8_t>()> in_func,
+                         FunctionRef<void(Span<uint8_t> buf)> out_func, int *out_code)
+ {
++#if defined(__ANDROID__) && __ANDROID_API__ < 28
++    errno = ENOSYS;
++    return false;
++#else
+     BlockAllocator temp_alloc;
+ 
+     // Create read pipes
+@@ -5623,6 +5627,7 @@
+         *out_code = -1;
+     }
+     return true;
++#endif
+ }
+ 
+ #endif
